@@ -13,6 +13,9 @@ import os
 import uuid
 import time
 import re
+import logging
+import traceback
+import importlib.metadata
 
 
 # ============================================================
@@ -58,7 +61,9 @@ app = Flask(__name__)
 # ============================================================
 
 SERVICE_NAME = "edge-tts-api"
-SERVICE_VERSION = "3.0.0-documentary-dynamic"
+SERVICE_VERSION = "3.1.0-diagnostic-retry"
+logger = logging.getLogger("midnight_tts")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 
 DEFAULT_VOICE = "zh-TW-YunJheNeural"
 
@@ -927,6 +932,7 @@ def health_payload():
 
         "status":
             "ok",
+        "edge_tts_version": importlib.metadata.version("edge-tts"),
 
         "service":
             SERVICE_NAME,
@@ -1022,50 +1028,24 @@ async def create_standard_speech(
 # DYNAMIC TTS
 # ============================================================
 
-async def create_dynamic_speech(
-    text,
-    voice,
-    base_rate,
-    base_pitch,
-    volume,
-    output_path
-):
+async def create_dynamic_speech(text, voice, base_rate, base_pitch, volume, output_path):
+    """Generate each prosody segment and combine complete MP3 chunks.
 
-    segments = build_dynamic_segments(
-        text
-    )
-
+    A failed segment aborts the whole request; no partial audio is returned.
+    """
+    segments = build_dynamic_segments(text)
     if not segments:
-        raise RuntimeError(
-            "no valid dynamic TTS segments generated"
-        )
+        raise RuntimeError("no valid dynamic TTS segments generated")
 
-
-    with open(
-        output_path,
-        "wb"
-    ) as output_file:
-
-        for index, segment in enumerate(
-            segments
-        ):
-
-            profile = classify_segment(
-                text=segment,
-                index=index,
-                total=len(segments),
+    # MP3 streams from Edge TTS are independently encoded; concatenating complete
+    # MP3 streams is kept for compatibility with the existing render pipeline.
+    # Re-encoding to a single stream would require ffmpeg on the TTS host.
+    with open(output_path, "wb") as output_file:
+        for index, segment in enumerate(segments):
+            profile = classify_segment(segment, index, len(segments))
+            segment_rate, segment_pitch = build_segment_prosody(
+                base_rate, base_pitch, profile
             )
-
-
-            segment_rate, segment_pitch = (
-                build_segment_prosody(
-                    base_rate=base_rate,
-                    base_pitch=base_pitch,
-                    profile_name=profile,
-                )
-            )
-
-
             communicate = edge_tts.Communicate(
                 text=segment,
                 voice=voice,
@@ -1073,51 +1053,16 @@ async def create_dynamic_speech(
                 pitch=segment_pitch,
                 volume=volume,
             )
-
-
-            audio_received = False
-
-
+            segment_audio = bytearray()
             async for chunk in communicate.stream():
-
-                if (
-                    chunk.get(
-                        "type"
-                    )
-                    !=
-                    "audio"
-                ):
-                    continue
-
-
-                data = chunk.get(
-                    "data"
-                )
-
-
-                if not data:
-                    continue
-
-
-                output_file.write(
-                    data
-                )
-
-
-                audio_received = True
-
-
-            if not audio_received:
-
+                if chunk.get("type") == "audio" and chunk.get("data"):
+                    segment_audio.extend(chunk["data"])
+            if len(segment_audio) <= 100:
                 raise RuntimeError(
-                    f"segment {index + 1} returned no audio"
+                    f"segment {index + 1}/{len(segments)} returned no valid audio"
                 )
-
-
-    return {
-        "segments":
-            len(segments),
-    }
+            output_file.write(segment_audio)
+    return {"segments": len(segments)}
 
 
 # ============================================================
@@ -1279,6 +1224,8 @@ def generate_tts_with_retry(
 
         except asyncio.TimeoutError:
 
+            logger.warning("TTS timeout: attempt=%s/%s mode=%s chars=%s", attempt, MAX_TTS_ATTEMPTS, mode, len(text))
+
             last_error = (
                 f"TTS generation timeout after "
                 f"{TTS_TIMEOUT_SECONDS} seconds"
@@ -1287,6 +1234,7 @@ def generate_tts_with_retry(
 
         except Exception as error:
 
+            logger.error("TTS upstream failure: attempt=%s/%s mode=%s chars=%s error_type=%s error=%s", attempt, MAX_TTS_ATTEMPTS, mode, len(text), type(error).__name__, str(error)[:600])
             last_error = clean_text(
                 error
             )
